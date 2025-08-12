@@ -406,7 +406,7 @@ async def on_message(new_msg: discord.Message) -> None:
     # Generate and send response message(s) (can be multiple if response is long)
     curr_content = finish_reason = edit_task = None
     response_msgs = []
-    response_contents = [""] # Start with one empty string for the first message content
+    response_contents = []
 
     use_plain_responses = config.get("use_plain_responses", False)
     max_message_length = 2000 if use_plain_responses else (4096 - len(STREAMING_INDICATOR))
@@ -414,9 +414,7 @@ async def on_message(new_msg: discord.Message) -> None:
     # Safety limits to prevent endless streaming
     max_stream_seconds = config.get("max_stream_seconds", 120)
     max_stream_idle_seconds = config.get("max_stream_idle_seconds", 120)
-    max_total_response_chars = config.get("max_total_response_chars", 25000)
-    max_stream_idle_seconds = config.get("max_stream_idle_seconds", 120)
-    max_total_response_chars = config.get("max_total_response_chars", 25000)
+    max_total_response_chars = config.get("max_total_response_chars", 12500)
 
     # use monotonic clock for elapsed-time checks (faster and immune to system clock changes)
     stream_start_ts = time.monotonic()
@@ -428,6 +426,17 @@ async def on_message(new_msg: discord.Message) -> None:
 
     try:
         async with new_msg.channel.typing():
+            # Send initial message with warnings if any
+            if user_warnings and not use_plain_responses:
+                embed = discord.Embed()
+                for warning in sorted(user_warnings):
+                    embed.add_field(name=warning, value="", inline=False)
+                embed.color = EMBED_COLOR_INCOMPLETE
+                response_msg = await new_msg.reply(embed=embed, silent=True)
+                response_msgs.append(response_msg)
+                msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
+                await msg_nodes[response_msg.id].lock.acquire()
+
             async for curr_chunk in await openai_client.chat.completions.create(model=model, messages=messages[::-1], stream=True, extra_body=model_parameters):
                 if stop_flags.get(channel_id):
                     user_warnings.add("⚠️ Response stopped by user.")
@@ -443,143 +452,94 @@ async def on_message(new_msg: discord.Message) -> None:
 
                 finish_reason = choice.finish_reason
 
-                # Accumulate content
-                chunk_content = choice.delta.content or ""
-                logging.info(f"API response chunk: {chunk_content}")
+                prev_content = curr_content or ""
+                curr_content = choice.delta.content or ""
+                logging.info(f"API response chunk: {curr_content}")
 
-                # Check if adding this chunk would overflow the current message
-                # If it's the very first chunk and response_msgs is empty, it's a new message anyway
-                # If response_contents[-1] + chunk_content exceeds max_message_length, it's an overflow
-                current_message_content_len = len(response_contents[-1])
-                would_overflow = (current_message_content_len + len(chunk_content)) > max_message_length
+                new_content = prev_content if finish_reason == None else (prev_content + curr_content)
+
+                if response_contents == [] and new_content == "":
+                    continue
+
+                if start_next_msg := response_contents == [] or len(response_contents[-1] + new_content) > max_message_length:
+                    response_contents.append("")
+
+                response_contents[-1] += new_content
+
+                # Track progress for safety checks
+                added_len = len(new_content)
+                if added_len > 0:
+                    total_response_chars += added_len
+                    last_progress_ts = now_ts
+
+                # Enforce limits: if tripped, force a graceful finish
+                hit_time_limit = (now_ts - stream_start_ts) > max_stream_seconds
+                hit_idle_limit = (now_ts - last_progress_ts) > max_stream_idle_seconds
+                hit_char_limit = total_response_chars >= max_total_response_chars
+                if hit_time_limit or hit_idle_limit or hit_char_limit:
+                    if hit_time_limit:
+                        user_warnings.add(f"⚠️ Stream timed out after {max_stream_seconds}s")
+                    if hit_idle_limit:
+                        user_warnings.add("⚠️ Stream ended due to inactivity")
+                    if hit_char_limit:
+                        user_warnings.add(f"⚠️ Max response length reached ({max_total_response_chars} chars)")
+                    if finish_reason is None:
+                        finish_reason = "length"  # trigger finalization below
 
                 if not use_plain_responses:
-                    # If overflow, finalize the previous message and prepare for a new one
-                    if would_overflow and response_msgs: # Only finalize if there's a previous message to finalize
-                        prev_response_msg = response_msgs[-1]
-                        prev_embed = discord.Embed()
-                        for warning in sorted(user_warnings):
-                            prev_embed.add_field(name=warning, value="", inline=False)
-                        prev_embed.description = response_contents[-1] # Final content of the previous message
-                        prev_embed.color = EMBED_COLOR_COMPLETE # Set to green
-                        await prev_response_msg.edit(embed=prev_embed)
-                        # Release the lock for the previous message's node
-                        if prev_response_msg.id in msg_nodes:
-                            msg_nodes[prev_response_msg.id].text = response_contents[-1]
-                            msg_nodes[prev_response_msg.id].lock.release()
+                    # Re-create embed to ensure all warnings are present
+                    embed = discord.Embed()
+                    for warning in sorted(user_warnings):
+                        embed.add_field(name=warning, value="", inline=False)
 
-                        response_contents.append("") # Start a new content buffer for the new message
+                    should_send_new_message = False
+                    if not response_msgs: # No messages sent yet (no initial warning embed)
+                        should_send_new_message = True
+                    elif len(response_contents[-1] + curr_content) > max_message_length: # Current message is full
+                        should_send_new_message = True
 
-                    response_contents[-1] += chunk_content # Add chunk to current message content
+                    ready_to_edit = (edit_task == None or edit_task.done()) and (now_ts - last_task_time) >= EDIT_DELAY_SECONDS
+                    is_final_edit = finish_reason != None or should_send_new_message
+                    is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
 
-                    # Track progress for safety checks
-                    added_len = len(chunk_content)
-                    if added_len > 0:
-                        total_response_chars += added_len
-                        last_progress_ts = now_ts
-
-                    # Enforce limits: if tripped, force a graceful finish
-                    hit_time_limit = (now_ts - stream_start_ts) > max_stream_seconds
-                    hit_idle_limit = (now_ts - last_progress_ts) > max_stream_idle_seconds
-                    hit_char_limit = total_response_chars >= max_total_response_chars
-                    if hit_time_limit or hit_idle_limit or hit_char_limit:
-                        if hit_time_limit:
-                            user_warnings.add(f"⚠️ Stream timed out after {max_stream_seconds}s")
-                        if hit_idle_limit:
-                            user_warnings.add("⚠️ Stream ended due to inactivity")
-                        if hit_char_limit:
-                            user_warnings.add(f"⚠️ Max response length reached ({max_total_response_chars} chars)")
-                        if finish_reason is None:
-                            finish_reason = "length"  # trigger finalization below
-
-                    # Determine if an edit or new send is needed for the *current* message being built
-                    ready_to_edit = (edit_task is None or edit_task.done()) and (now_ts - last_task_time) >= EDIT_DELAY_SECONDS
-                    is_final_stream_chunk = finish_reason is not None # The API stream has ended
-
-                    # If it's the very first message, or we just started a new message due to overflow, or it's time to edit, or it's the final chunk
-                    if not response_msgs or would_overflow or ready_to_edit or is_final_stream_chunk:
-                        if edit_task is not None:
+                    if should_send_new_message or ready_to_edit or is_final_edit:
+                        if edit_task != None:
                             await edit_task
 
-                        # Create/update embed for the *current* message being built
-                        current_embed = discord.Embed()
-                        for warning in sorted(user_warnings):
-                            current_embed.add_field(name=warning, value="", inline=False)
+                        if should_send_new_message and response_msgs:
+                            # Finalize the previous message before sending a new one
+                            prev_response_msg = response_msgs[-1]
+                            prev_embed = discord.Embed(
+                                description=response_contents[-1],
+                                color=EMBED_COLOR_COMPLETE
+                            )
+                            for warning in sorted(user_warnings):
+                                prev_embed.add_field(name=warning, value="", inline=False)
+                            await prev_response_msg.edit(embed=prev_embed)
 
-                        current_embed.description = response_contents[-1] # This is the content for the current message
-                        if not is_final_stream_chunk:
-                            current_embed.description += STREAMING_INDICATOR
+                        embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
+                        embed.color = EMBED_COLOR_COMPLETE if should_send_new_message or is_good_finish else EMBED_COLOR_INCOMPLETE
 
-                        # Color should be complete if it's the final chunk and a good finish, otherwise incomplete
-                        current_embed.color = EMBED_COLOR_COMPLETE if is_final_stream_chunk and finish_reason.lower() in ("stop", "end_turn") else EMBED_COLOR_INCOMPLETE
-
-                        if not response_msgs or would_overflow: # Send a new message
-                            reply_to_msg = new_msg if not response_msgs else response_msgs[-1] # Reply to the original message or the last sent message
-                            response_msg = await reply_to_msg.reply(embed=current_embed, silent=True)
+                        if should_send_new_message:
+                            reply_to_msg = new_msg if not response_msgs else response_msgs[-1]
+                            response_msg = await reply_to_msg.reply(embed=embed, silent=True)
                             response_msgs.append(response_msg)
 
                             msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
                             await msg_nodes[response_msg.id].lock.acquire()
-                        else: # Edit the existing last message
-                            edit_task = asyncio.create_task(response_msgs[-1].edit(embed=current_embed))
+                            response_contents.append("") # Start a new content buffer for the new message
+                        else:
+                            edit_task = asyncio.create_task(response_msgs[-1].edit(embed=embed))
 
+                        # record last task time with monotonic clock
                         last_task_time = now_ts
 
-                else: # use_plain_responses is True
-                    # This part also needs to handle message splitting for plain text
-                    if would_overflow and response_msgs:
-                        reply_to_msg = new_msg if not response_msgs else response_msgs[-1]
-                        response_msg = await reply_to_msg.reply(content=response_contents[-1], suppress_embeds=True)
-                        response_msgs.append(response_msg)
-                        msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
-                        await msg_nodes[response_msg.id].lock.acquire()
-                        response_contents.append("")
-
-                    response_contents[-1] += chunk_content
-
-                    # Track progress for safety checks (same as above)
-                    added_len = len(chunk_content)
-                    if added_len > 0:
-                        total_response_chars += added_len
-                        last_progress_ts = now_ts
-
-                    # Enforce limits (same as above)
-                    hit_time_limit = (now_ts - stream_start_ts) > max_stream_seconds
-                    hit_idle_limit = (now_ts - last_progress_ts) > max_stream_idle_seconds
-                    hit_char_limit = total_response_chars >= max_total_response_chars
-                    if hit_time_limit or hit_idle_limit or hit_char_limit:
-                        if hit_time_limit:
-                            user_warnings.add(f"⚠️ Stream timed out after {max_stream_seconds}s")
-                        if hit_idle_limit:
-                            user_warnings.add("⚠️ Stream ended due to inactivity")
-                        if hit_char_limit:
-                            user_warnings.add(f"⚠️ Max response length reached ({max_total_response_chars} chars)")
-                        if finish_reason is None:
-                            finish_reason = "length"  # trigger finalization below
-
-            # After the loop, finalize the last message if it's an embed
-            if response_msgs and not use_plain_responses:
-                if edit_task is not None:
-                    await edit_task # Ensure any pending edit is complete
-
-                final_embed = discord.Embed()
-                for warning in sorted(user_warnings):
-                    final_embed.add_field(name=warning, value="", inline=False)
-                final_embed.description = response_contents[-1]
-                final_embed.color = EMBED_COLOR_COMPLETE # Always green at the end
-
-                await response_msgs[-1].edit(embed=final_embed)
-                if response_msgs[-1].id in msg_nodes:
-                    msg_nodes[response_msgs[-1].id].text = response_contents[-1]
-                    msg_nodes[response_msgs[-1].id].lock.release()
-
-            elif response_msgs and use_plain_responses:
-                # For plain responses, ensure the last message is sent if it wasn't already
-                # This might be redundant if the loop always sends the last chunk, but good for safety
-                if response_contents[-1] != msg_nodes[response_msgs[-1].id].text: # Check if content was fully sent
-                    reply_to_msg = new_msg if len(response_msgs) == 1 else response_msgs[-1]
-                    response_msg = await reply_to_msg.reply(content=response_contents[-1], suppress_embeds=True)
+            if use_plain_responses:
+                for content in response_contents:
+                    reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
+                    response_msg = await reply_to_msg.reply(content=content, suppress_embeds=True)
                     response_msgs.append(response_msg)
+
                     msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
                     await msg_nodes[response_msg.id].lock.acquire()
 
@@ -590,11 +550,9 @@ async def on_message(new_msg: discord.Message) -> None:
         stop_flags.pop(channel_id, None)
 
 
-    # Corrected finalization of msg_nodes
-    for i, response_msg in enumerate(response_msgs):
-        if response_msg.id in msg_nodes and msg_nodes[response_msg.id].lock.locked():
-            msg_nodes[response_msg.id].text = response_contents[i]
-            msg_nodes[response_msg.id].lock.release()
+    for response_msg in response_msgs:
+        msg_nodes[response_msg.id].text = "".join(response_contents)
+        msg_nodes[response_msg.id].lock.release()
 
     # Delete oldest MsgNodes (lowest message IDs) from the cache
     if (num_nodes := len(msg_nodes)) > MAX_MESSAGE_NODES:
