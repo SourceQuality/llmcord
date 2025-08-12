@@ -1,6 +1,7 @@
 # This gitignore is a whitelist. Inspired by https://rgbcu.be/blog/gitignore
 
 *
+!*/
 
 !.gitignore
 
@@ -11,5 +12,6 @@
 !config-example.yaml
 !docker-compose.yaml
 !requirements.txt
-!.github/*
-!.github/workflows/docker-publish.yml
+
+!.github/
+!.github/workflows/**
