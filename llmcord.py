@@ -56,8 +56,8 @@ PROVIDERS_SUPPORTING_USERNAMES = ("openai", "x-ai")
 EMBED_COLOR_COMPLETE = discord.Color.dark_green()
 EMBED_COLOR_INCOMPLETE = discord.Color.orange()
 
-STREAMING_INDICATOR = " ⚪"
-EDIT_DELAY_SECONDS = 1
+STREAMING_INDICATOR = " <a:mattpet:983747283281653830> Thinking..."
+EDIT_DELAY_SECONDS = .2
 
 MAX_MESSAGE_NODES = 500
 
@@ -414,7 +414,7 @@ async def on_message(new_msg: discord.Message) -> None:
     # Safety limits to prevent endless streaming
     max_stream_seconds = config.get("max_stream_seconds", 120)
     max_stream_idle_seconds = config.get("max_stream_idle_seconds", 120)
-    max_total_response_chars = config.get("max_total_response_chars", 12500)
+    max_total_response_chars = config.get("max_total_response_chars", 12300)
 
     # use monotonic clock for elapsed-time checks (faster and immune to system clock changes)
     stream_start_ts = time.monotonic()
@@ -452,22 +452,57 @@ async def on_message(new_msg: discord.Message) -> None:
 
                 finish_reason = choice.finish_reason
 
-                prev_content = curr_content or ""
-                curr_content = choice.delta.content or ""
-                logging.info(f"API response chunk: {curr_content}")
+                # Accumulate streaming content correctly; don't drop the first characters
+                delta = choice.delta.content or ""
+                logging.info(f"API response chunk: {delta}")
 
-                new_content = prev_content if finish_reason == None else (prev_content + curr_content)
-
-                if response_contents == [] and new_content == "":
+                # Skip empty progress unless it's the final packet
+                if response_contents == [] and delta == "" and finish_reason is None:
                     continue
 
-                if start_next_msg := response_contents == [] or len(response_contents[-1] + new_content) > max_message_length:
+                # Ensure we have a buffer to write into
+                if response_contents == []:
                     response_contents.append("")
 
-                response_contents[-1] += new_content
+                # If adding this delta would overflow the current message, finalize it and start a new one
+                if not use_plain_responses and len(response_contents[-1]) + len(delta) > max_message_length:
+                    if response_msgs:
+                        try:
+                            finalize_embed = discord.Embed()
+                            for warning in sorted(user_warnings):
+                                finalize_embed.add_field(name=warning, value="", inline=False)
+                            finalize_embed.description = response_contents[-1]
+                            finalize_embed.color = EMBED_COLOR_COMPLETE
+                            if edit_task is not None:
+                                await edit_task
+                            edit_task = asyncio.create_task(response_msgs[-1].edit(embed=finalize_embed))
+                            await edit_task
+                        except Exception:
+                            logging.exception("Failed to finalize embed during overflow")
+
+                    # Start a new buffer and seed it with the current delta
+                    response_contents.append("")
+                    if delta:
+                        response_contents[-1] += delta
+
+                    # Send a new message to continue streaming
+                    new_embed = discord.Embed()
+                    for warning in sorted(user_warnings):
+                        new_embed.add_field(name=warning, value="", inline=False)
+                    new_embed.description = response_contents[-1] + STREAMING_INDICATOR
+                    new_embed.color = EMBED_COLOR_INCOMPLETE
+                    reply_to_msg = new_msg if not response_msgs else response_msgs[-1]
+                    response_msg = await reply_to_msg.reply(embed=new_embed, silent=True)
+                    response_msgs.append(response_msg)
+                    msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
+                    await msg_nodes[response_msg.id].lock.acquire()
+                    last_task_time = now_ts
+                else:
+                    # Normal accumulation into current buffer
+                    response_contents[-1] += delta
 
                 # Track progress for safety checks
-                added_len = len(new_content)
+                added_len = len(delta)
                 if added_len > 0:
                     total_response_chars += added_len
                     last_progress_ts = now_ts
@@ -492,46 +527,27 @@ async def on_message(new_msg: discord.Message) -> None:
                     for warning in sorted(user_warnings):
                         embed.add_field(name=warning, value="", inline=False)
 
-                    should_send_new_message = False
-                    if not response_msgs: # No messages sent yet (no initial warning embed)
-                        should_send_new_message = True
-                    elif len(response_contents[-1] + curr_content) > max_message_length: # Current message is full
-                        should_send_new_message = True
-
                     ready_to_edit = (edit_task == None or edit_task.done()) and (now_ts - last_task_time) >= EDIT_DELAY_SECONDS
-                    is_final_edit = finish_reason != None or should_send_new_message
+                    is_final_edit = finish_reason != None
                     is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
 
-                    if should_send_new_message or ready_to_edit or is_final_edit:
+                    # Send first message or update existing one
+                    if (not response_msgs) or ready_to_edit or is_final_edit:
                         if edit_task != None:
                             await edit_task
 
-                        if should_send_new_message and response_msgs:
-                            # Finalize the previous message before sending a new one
-                            prev_response_msg = response_msgs[-1]
-                            prev_embed = discord.Embed(
-                                description=response_contents[-1],
-                                color=EMBED_COLOR_COMPLETE
-                            )
-                            for warning in sorted(user_warnings):
-                                prev_embed.add_field(name=warning, value="", inline=False)
-                            await prev_response_msg.edit(embed=prev_embed)
-
                         embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
-                        embed.color = EMBED_COLOR_COMPLETE if should_send_new_message or is_good_finish else EMBED_COLOR_INCOMPLETE
+                        embed.color = EMBED_COLOR_COMPLETE if is_good_finish else EMBED_COLOR_INCOMPLETE
 
-                        if should_send_new_message:
-                            reply_to_msg = new_msg if not response_msgs else response_msgs[-1]
+                        if not response_msgs:
+                            reply_to_msg = new_msg
                             response_msg = await reply_to_msg.reply(embed=embed, silent=True)
                             response_msgs.append(response_msg)
-
                             msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
                             await msg_nodes[response_msg.id].lock.acquire()
-                            response_contents.append("") # Start a new content buffer for the new message
                         else:
                             edit_task = asyncio.create_task(response_msgs[-1].edit(embed=embed))
 
-                        # record last task time with monotonic clock
                         last_task_time = now_ts
 
             if use_plain_responses:
@@ -542,6 +558,20 @@ async def on_message(new_msg: discord.Message) -> None:
 
                     msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
                     await msg_nodes[response_msg.id].lock.acquire()
+            else:
+                # Finalize last embed (remove indicator, turn green)
+                if response_msgs:
+                    try:
+                        final_embed = discord.Embed()
+                        for warning in sorted(user_warnings):
+                            final_embed.add_field(name=warning, value="", inline=False)
+                        final_embed.description = response_contents[-1] if response_contents else ""
+                        final_embed.color = EMBED_COLOR_COMPLETE
+                        if edit_task is not None:
+                            await edit_task
+                        await response_msgs[-1].edit(embed=final_embed)
+                    except Exception:
+                        logging.exception("Failed to finalize embed after stream end")
 
     except Exception:
         logging.exception("Error while generating response")
