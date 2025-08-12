@@ -49,6 +49,29 @@ Or run local models with:
 
 ---
 
+### Slash commands
+
+- /model [model]
+  - View the current model or switch to another.
+  - Only admins (config.permissions.users.admin_ids) can change the model.
+  - Autocomplete suggests models from your config.
+
+- /memory add sentence
+  - Adds a memory for the current server. The bot confirms and posts a small public note in the channel.
+
+- /memory remove memory_id
+  - Removes a memory by ID. Uses autocomplete to pick from existing memories.
+
+- /memory list
+  - Shows all memories for the current server.
+
+Notes:
+- Memory is per-server; DMs have their own separate memory space.
+- Server memories are injected into the system prompt under a "# Server memory:" section and influence all conversations in that server.
+- Data is stored in a SQLite DB at /opt/llmcord/db/memory.db. If using Docker, mount a volume to persist across restarts.
+
+---
+
 ### And more:
 - Supports image attachments when using a vision model (like gpt-5, grok-4, claude-4, etc.)
 - Supports text file attachments (.txt, .py, .c, etc.)
@@ -65,7 +88,7 @@ Or run local models with:
 
 1. Clone the repo:
    ```bash
-   git clone https://github.com/jakobdylanc/llmcord
+   git clone https://github.com/sourcequality/llmcord
    ```
 
 2. Create a copy of "config-example.yaml" named "config.yaml" and set it up:
