@@ -1,8 +1,8 @@
-FROM python:3.13-slim
+FROM python:3.12-slim
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-WORKDIR /app
+WORKDIR /usr/src/app
 
 COPY requirements.txt .
 

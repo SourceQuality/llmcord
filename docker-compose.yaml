@@ -4,4 +4,5 @@ services:
     network_mode: host
     restart: unless-stopped
     volumes:
-      - ./:/app:ro
+      - ./:/usr/src/app:ro
+      - ./db:/opt/llmcord/db

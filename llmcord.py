@@ -7,17 +7,49 @@ from typing import Any, Literal, Optional
 
 import discord
 from discord.app_commands import Choice
+from discord import app_commands
+
 from discord.ext import commands
 import httpx
 from openai import AsyncOpenAI
 import yaml
+import sqlite3
+
+MEM_DB = "/opt/llmcord/db/memory.db"
+
+def ensure_memory_table():
+    with sqlite3.connect(MEM_DB) as conn:
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER,
+                sentence TEXT
+)
+        """)
+        conn.commit()
+
+
+def get_server_memories(guild_id: Optional[int]) -> str:
+    try:
+        with sqlite3.connect(MEM_DB) as conn:
+            c = conn.cursor()
+            c.execute("SELECT sentence FROM memories WHERE guild_id = ?", (guild_id,))
+            rows = c.fetchall()
+        return "\n".join(row[0] for row in rows)
+    except Exception as e:
+        logging.warning(f"Error fetching server memories: {e}")
+        return ""
+
+
+
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
 )
 
-VISION_MODEL_TAGS = ("claude", "gemini", "gemma", "gpt-4", "gpt-5", "grok-4", "llama", "llava", "mistral", "o3", "o4", "vision", "vl")
+VISION_MODEL_TAGS = ("gpt-4", "o3", "o4", "grok-4", "claude", "gemini", "gemma", "llama", "pixtral", "mistral", "vision", "vl")
 PROVIDERS_SUPPORTING_USERNAMES = ("openai", "x-ai")
 
 EMBED_COLOR_COMPLETE = discord.Color.dark_green()
@@ -35,6 +67,7 @@ def get_config(filename: str = "config.yaml") -> dict[str, Any]:
 
 
 config = get_config()
+ensure_memory_table()
 curr_model = next(iter(config["models"]))
 
 msg_nodes = {}
@@ -44,6 +77,8 @@ intents = discord.Intents.default()
 intents.message_content = True
 activity = discord.CustomActivity(name=(config["status_message"] or "github.com/jakobdylanc/llmcord")[:128])
 discord_bot = commands.Bot(intents=intents, activity=activity, command_prefix=None)
+memory_group = app_commands.Group(name="memory", description="Manage your memories")
+discord_bot.tree.add_command(memory_group)
 
 httpx_client = httpx.AsyncClient()
 
@@ -83,6 +118,7 @@ async def model_command(interaction: discord.Interaction, model: str) -> None:
 
 @model_command.autocomplete("model")
 async def model_autocomplete(interaction: discord.Interaction, curr_str: str) -> list[Choice[str]]:
+    
     global config
 
     if curr_str == "":
@@ -93,7 +129,106 @@ async def model_autocomplete(interaction: discord.Interaction, curr_str: str) ->
 
     return choices
 
+@memory_group.command(name="add", description="Add a memory for this server.")
+@app_commands.describe(sentence="What should the bot remember?")
+async def memory_add(interaction: discord.Interaction, sentence: str):
+    guild_id = interaction.guild.id if interaction.guild else None
 
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        with sqlite3.connect(MEM_DB) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR IGNORE INTO memories (guild_id, sentence) VALUES (?, ?)",
+                (guild_id, sentence),
+            )
+            conn.commit()
+
+        await interaction.followup.send(f"✅ Memory added.")
+        await interaction.channel.send(f"🧠 <@{interaction.user.id}> added: *{sentence}*")
+    except Exception as e:
+        logging.exception("Failed to add memory")
+        await interaction.followup.send("❌ Failed to save memory.")
+
+
+async def memory_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    guild_id = interaction.guild.id if interaction.guild else None
+    try:
+        with sqlite3.connect(MEM_DB) as conn:
+            c = conn.cursor()
+            c.execute("SELECT id, sentence FROM memories WHERE guild_id = ?", (guild_id,))
+            rows = c.fetchall()
+
+        return [
+            app_commands.Choice(name=sentence[:100], value=str(mem_id))  # 👈 value must be the ID
+            for mem_id, sentence in rows if current.lower() in sentence.lower()
+        ][:25]
+    except Exception as e:
+        logging.warning(f"Failed to autocomplete memory remove: {e}")
+        return []
+
+
+
+
+@memory_group.command(name="remove", description="Remove a memory sentence.")
+@app_commands.describe(memory_id="The memory to remove")
+@app_commands.autocomplete(memory_id=memory_autocomplete)
+async def memory_remove(interaction: discord.Interaction, memory_id: str):
+    guild_id = interaction.guild.id if interaction.guild else None
+
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
+
+    try:
+        with sqlite3.connect(MEM_DB) as conn:
+            c = conn.cursor()
+            c.execute("SELECT sentence FROM memories WHERE id = ? AND guild_id = ?", (memory_id, guild_id))
+            row = c.fetchone()
+
+            if not row:
+                await interaction.followup.send("⚠️ That memory doesn't exist.", ephemeral=True)
+                return
+
+            sentence = row[0]
+            c.execute("DELETE FROM memories WHERE id = ? AND guild_id = ?", (memory_id, guild_id))
+            conn.commit()
+
+        await interaction.followup.send("✅ Memory removed.", ephemeral=True)
+        await interaction.channel.send(f"🧠 <@{interaction.user.id}> removed: *{sentence}*")
+
+    except Exception as e:
+        logging.exception("Failed to remove memory")
+        await interaction.followup.send("❌ Failed to remove memory.", ephemeral=True)
+
+
+
+
+
+@memory_group.command(name="list", description="List server memories.")
+async def memory_list(interaction: discord.Interaction):
+    guild_id = interaction.guild.id if interaction.guild else None
+
+    await interaction.response.defer(ephemeral=True) 
+
+    try:
+        with sqlite3.connect(MEM_DB) as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT sentence FROM memories WHERE guild_id = ?",
+                (guild_id,),
+            )
+            rows = c.fetchall()
+
+        if rows:
+            sentences = "\n".join(f"- {row[0]}" for row in rows)
+            await interaction.followup.send(f"🧠 Server memories:\n{sentences}")
+        else:
+            await interaction.followup.send("🧠 No memories set yet.")
+    except Exception as e:
+        logging.exception("Failed to list memories")
+        await interaction.followup.send("❌ Failed to list memories.")
+ 
 @discord_bot.event
 async def on_ready() -> None:
     if client_id := config["client_id"]:
@@ -138,21 +273,14 @@ async def on_message(new_msg: discord.Message) -> None:
         return
 
     provider_slash_model = curr_model
-    provider, model = provider_slash_model.removesuffix(":vision").split("/", 1)
-
-    provider_config = config["providers"][provider]
-
-    base_url = provider_config["base_url"]
-    api_key = provider_config.get("api_key", "sk-no-key-required")
-    openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
-
+    provider, model = provider_slash_model.split("/", 1)
     model_parameters = config["models"].get(provider_slash_model, None)
 
-    extra_headers = provider_config.get("extra_headers", None)
-    extra_query = provider_config.get("extra_query", None)
-    extra_body = (provider_config.get("extra_body", None) or {}) | (model_parameters or {}) or None
+    base_url = config["providers"][provider]["base_url"]
+    api_key = config["providers"][provider].get("api_key", "sk-no-key-required")
+    openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
 
-    accept_images = any(x in provider_slash_model.lower() for x in VISION_MODEL_TAGS)
+    accept_images = any(x in model.lower() for x in VISION_MODEL_TAGS)
     accept_usernames = any(x in provider_slash_model.lower() for x in PROVIDERS_SUPPORTING_USERNAMES)
 
     max_text = config.get("max_text", 100000)
@@ -243,15 +371,25 @@ async def on_message(new_msg: discord.Message) -> None:
 
     if system_prompt := config["system_prompt"]:
         now = datetime.now().astimezone()
-
         system_prompt = system_prompt.replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
+    
+        # Inject per-user/server memory
+        memory_text = get_server_memories(new_msg.guild.id if new_msg.guild else None)
+        if memory_text:
+            system_prompt += f"\n\n# Server memory:\n{memory_text}"
+
+    
         if accept_usernames:
             system_prompt += "\nUser's names are their Discord IDs and should be typed as '<@ID>'."
+    
+        logging.info(f"Final system prompt:\n{system_prompt}") 
+    
+        messages.insert(0, dict(role="system", content=system_prompt))  
 
-        messages.append(dict(role="system", content=system_prompt))
+
 
     # Generate and send response message(s) (can be multiple if response is long)
-    curr_content = finish_reason = None
+    curr_content = finish_reason = edit_task = None
     response_msgs = []
     response_contents = []
 
@@ -262,14 +400,13 @@ async def on_message(new_msg: discord.Message) -> None:
     use_plain_responses = config.get("use_plain_responses", False)
     max_message_length = 2000 if use_plain_responses else (4096 - len(STREAMING_INDICATOR))
 
-    kwargs = dict(model=model, messages=messages[::-1], stream=True, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
     try:
         async with new_msg.channel.typing():
-            async for chunk in await openai_client.chat.completions.create(**kwargs):
+            async for curr_chunk in await openai_client.chat.completions.create(model=model, messages=messages[::-1], stream=True, extra_body=model_parameters):
                 if finish_reason != None:
                     break
 
-                if not (choice := chunk.choices[0] if chunk.choices else None):
+                if not (choice := curr_chunk.choices[0] if curr_chunk.choices else None):
                     continue
 
                 finish_reason = choice.finish_reason
@@ -288,14 +425,15 @@ async def on_message(new_msg: discord.Message) -> None:
                 response_contents[-1] += new_content
 
                 if not use_plain_responses:
-                    time_delta = datetime.now().timestamp() - last_task_time
-
-                    ready_to_edit = time_delta >= EDIT_DELAY_SECONDS
+                    ready_to_edit = (edit_task == None or edit_task.done()) and datetime.now().timestamp() - last_task_time >= EDIT_DELAY_SECONDS
                     msg_split_incoming = finish_reason == None and len(response_contents[-1] + curr_content) > max_message_length
                     is_final_edit = finish_reason != None or msg_split_incoming
                     is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
 
                     if start_next_msg or ready_to_edit or is_final_edit:
+                        if edit_task != None:
+                            await edit_task
+
                         embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
                         embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
 
@@ -307,8 +445,7 @@ async def on_message(new_msg: discord.Message) -> None:
                             msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
                             await msg_nodes[response_msg.id].lock.acquire()
                         else:
-                            await asyncio.sleep(EDIT_DELAY_SECONDS - time_delta)
-                            await response_msg.edit(embed=embed)
+                            edit_task = asyncio.create_task(response_msgs[-1].edit(embed=embed))
 
                         last_task_time = datetime.now().timestamp()
 
