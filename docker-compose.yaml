@@ -1,6 +1,6 @@
 services:
   container:
-    image: ghcr.io/sourcequality/llmcord:latest
+    image: ghcr.io/sourcequality/llmcord:dev
     container_name: llmcord
     network_mode: host
     restart: unless-stopped
