@@ -56,7 +56,7 @@ PROVIDERS_SUPPORTING_USERNAMES = ("openai", "x-ai")
 EMBED_COLOR_COMPLETE = discord.Color.dark_green()
 EMBED_COLOR_INCOMPLETE = discord.Color.orange()
 
-STREAMING_INDICATOR = " <a:mattpet:983747283281653830> Thinking..."
+STREAMING_INDICATOR = " 🤔 Thinking..."
 EDIT_DELAY_SECONDS = .2
 
 MAX_MESSAGE_NODES = 500
