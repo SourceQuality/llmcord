@@ -105,6 +105,7 @@ class MsgNode:
 @discord_bot.tree.command(name="model", description="View or switch the current model")
 async def model_command(interaction: discord.Interaction, model: str) -> None:
     global curr_model
+    ephemeral_allowed = interaction.guild is not None
 
     if model == curr_model:
         output = f"Current model: `{curr_model}`"
@@ -116,7 +117,7 @@ async def model_command(interaction: discord.Interaction, model: str) -> None:
         else:
             output = "You don't have permission to change the model."
 
-    await interaction.response.send_message(output, ephemeral=(interaction.channel.type == discord.ChannelType.private))
+    await interaction.response.send_message(output, ephemeral=ephemeral_allowed)
 
 
 @model_command.autocomplete("model")
@@ -136,8 +137,13 @@ async def model_autocomplete(interaction: discord.Interaction, curr_str: str) ->
 @app_commands.describe(sentence="What should the bot remember?")
 async def memory_add(interaction: discord.Interaction, sentence: str):
     guild_id = interaction.guild.id if interaction.guild else None
+    ephemeral_allowed = interaction.guild is not None
 
-    await interaction.response.defer(ephemeral=True)
+    try:
+        await interaction.response.defer(ephemeral=ephemeral_allowed)
+    except (discord.NotFound, discord.HTTPException):
+        # Interaction likely expired or invalid; continue without deferral
+        logging.warning("memory_add: could not defer interaction (expired or invalid)")
 
     try:
         with sqlite3.connect(MEM_DB) as conn:
@@ -148,11 +154,18 @@ async def memory_add(interaction: discord.Interaction, sentence: str):
             )
             conn.commit()
 
-        await interaction.followup.send(f"✅ Memory added.")
+        try:
+            await interaction.followup.send(f"✅ Memory added.", ephemeral=ephemeral_allowed)
+        except (discord.NotFound, discord.HTTPException):
+            # Fallback: post a normal message
+            await interaction.channel.send(f"✅ Memory added.")
         await interaction.channel.send(f"🧠 <@{interaction.user.id}> added: *{sentence}*")
     except Exception as e:
         logging.exception("Failed to add memory")
-        await interaction.followup.send("❌ Failed to save memory.")
+        try:
+            await interaction.followup.send("❌ Failed to save memory.", ephemeral=ephemeral_allowed)
+        except (discord.NotFound, discord.HTTPException):
+            await interaction.channel.send("❌ Failed to save memory.")
 
 
 async def memory_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
@@ -179,30 +192,53 @@ async def memory_autocomplete(interaction: discord.Interaction, current: str) ->
 @app_commands.autocomplete(memory_id=memory_autocomplete)
 async def memory_remove(interaction: discord.Interaction, memory_id: str):
     guild_id = interaction.guild.id if interaction.guild else None
+    ephemeral_allowed = interaction.guild is not None
 
     if not interaction.response.is_done():
-        await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.response.defer(ephemeral=ephemeral_allowed)
+        except (discord.NotFound, discord.HTTPException):
+            logging.warning("memory_remove: could not defer interaction (expired or invalid)")
 
     try:
+        # Ensure ID is an integer
+        try:
+            mem_id_int = int(memory_id)
+        except ValueError:
+            try:
+                await interaction.followup.send("⚠️ Invalid memory id.", ephemeral=ephemeral_allowed)
+            except (discord.NotFound, discord.HTTPException):
+                await interaction.channel.send("⚠️ Invalid memory id.")
+            return
+
         with sqlite3.connect(MEM_DB) as conn:
             c = conn.cursor()
-            c.execute("SELECT sentence FROM memories WHERE id = ? AND guild_id = ?", (memory_id, guild_id))
+            c.execute("SELECT sentence FROM memories WHERE id = ? AND guild_id = ?", (mem_id_int, guild_id))
             row = c.fetchone()
 
             if not row:
-                await interaction.followup.send("⚠️ That memory doesn't exist.", ephemeral=True)
+                try:
+                    await interaction.followup.send("⚠️ That memory doesn't exist.", ephemeral=ephemeral_allowed)
+                except (discord.NotFound, discord.HTTPException):
+                    await interaction.channel.send("⚠️ That memory doesn't exist.")
                 return
 
             sentence = row[0]
-            c.execute("DELETE FROM memories WHERE id = ? AND guild_id = ?", (memory_id, guild_id))
+            c.execute("DELETE FROM memories WHERE id = ? AND guild_id = ?", (mem_id_int, guild_id))
             conn.commit()
 
-        await interaction.followup.send("✅ Memory removed.", ephemeral=True)
+        try:
+            await interaction.followup.send("✅ Memory removed.", ephemeral=ephemeral_allowed)
+        except (discord.NotFound, discord.HTTPException):
+            await interaction.channel.send("✅ Memory removed.")
         await interaction.channel.send(f"🧠 <@{interaction.user.id}> removed: *{sentence}*")
 
     except Exception as e:
         logging.exception("Failed to remove memory")
-        await interaction.followup.send("❌ Failed to remove memory.", ephemeral=True)
+        try:
+            await interaction.followup.send("❌ Failed to remove memory.", ephemeral=ephemeral_allowed)
+        except (discord.NotFound, discord.HTTPException):
+            await interaction.channel.send("❌ Failed to remove memory.")
 
 
 
@@ -211,8 +247,12 @@ async def memory_remove(interaction: discord.Interaction, memory_id: str):
 @memory_group.command(name="list", description="List server memories.")
 async def memory_list(interaction: discord.Interaction):
     guild_id = interaction.guild.id if interaction.guild else None
+    ephemeral_allowed = interaction.guild is not None
 
-    await interaction.response.defer(ephemeral=True) 
+    try:
+        await interaction.response.defer(ephemeral=ephemeral_allowed) 
+    except (discord.NotFound, discord.HTTPException):
+        logging.warning("memory_list: could not defer interaction (expired or invalid)")
 
     try:
         with sqlite3.connect(MEM_DB) as conn:
@@ -225,23 +265,33 @@ async def memory_list(interaction: discord.Interaction):
 
         if rows:
             sentences = "\n".join(f"- {row[0]}" for row in rows)
-            await interaction.followup.send(f"🧠 Server memories:\n{sentences}")
+            try:
+                await interaction.followup.send(f"🧠 Server memories:\n{sentences}", ephemeral=ephemeral_allowed)
+            except (discord.NotFound, discord.HTTPException):
+                await interaction.channel.send(f"🧠 Server memories:\n{sentences}")
         else:
-            await interaction.followup.send("🧠 No memories set yet.")
+            try:
+                await interaction.followup.send("🧠 No memories set yet.", ephemeral=ephemeral_allowed)
+            except (discord.NotFound, discord.HTTPException):
+                await interaction.channel.send("🧠 No memories set yet.")
     except Exception as e:
         logging.exception("Failed to list memories")
-        await interaction.followup.send("❌ Failed to list memories.")
+        try:
+            await interaction.followup.send("❌ Failed to list memories.", ephemeral=ephemeral_allowed)
+        except (discord.NotFound, discord.HTTPException):
+            await interaction.channel.send("❌ Failed to list memories.")
  
 
 @discord_bot.tree.command(name="stop", description="Stop the bot's current response in this channel.")
 async def stop_command(interaction: discord.Interaction):
+    ephemeral_allowed = interaction.guild is not None
     channel_id = interaction.channel.id
     if channel_id not in active_streams:
-        await interaction.response.send_message("🤷 No active response to stop in this channel.", ephemeral=True)
+        await interaction.response.send_message("🤷 No active response to stop in this channel.", ephemeral=ephemeral_allowed)
         return
 
     stop_flags[channel_id] = True
-    await interaction.response.send_message("🛑 Stopping response...", ephemeral=True)
+    await interaction.response.send_message("🛑 Stopping response...", ephemeral=ephemeral_allowed)
 
 
 @discord_bot.event
