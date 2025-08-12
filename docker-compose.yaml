@@ -1,8 +1,10 @@
 services:
   container:
-    build: .
+    image: ghcr.io/sourcequality/llmcord:dev
+    container_name: llmcord
     network_mode: host
     restart: unless-stopped
     volumes:
-      - ./:/usr/src/app:ro
+      - ./config.yaml:/usr/src/app/config.yaml:ro
+      - ./llmcord.py:/usr/src/app/llmcord.py:ro
       - ./db:/opt/llmcord/db
