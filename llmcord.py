@@ -519,7 +519,7 @@ async def on_message(new_msg: discord.Message) -> None:
                     if hit_char_limit:
                         user_warnings.add(f"⚠️ Max response length reached ({max_total_response_chars} chars)")
                     if finish_reason is None:
-                        finish_reason = "length"  # trigger finalization below
+                        finish_reason = "limit_exceeded"  # trigger finalization below
 
                 if not use_plain_responses:
                     # Re-create embed to ensure all warnings are present
