@@ -400,6 +400,15 @@ async def on_message(new_msg: discord.Message) -> None:
     use_plain_responses = config.get("use_plain_responses", False)
     max_message_length = 2000 if use_plain_responses else (4096 - len(STREAMING_INDICATOR))
 
+    # Safety limits to prevent endless streaming
+    max_stream_seconds = config.get("max_stream_seconds", 90)
+    max_stream_idle_seconds = config.get("max_stream_idle_seconds", 60)
+    max_total_response_chars = config.get("max_total_response_chars", 90000)
+
+    stream_start_ts = datetime.now().timestamp()
+    last_progress_ts = stream_start_ts
+    total_response_chars = 0
+
     try:
         async with new_msg.channel.typing():
             async for curr_chunk in await openai_client.chat.completions.create(model=model, messages=messages[::-1], stream=True, extra_body=model_parameters):
@@ -423,6 +432,27 @@ async def on_message(new_msg: discord.Message) -> None:
                     response_contents.append("")
 
                 response_contents[-1] += new_content
+
+                # Track progress for safety checks
+                added_len = len(new_content)
+                if added_len > 0:
+                    total_response_chars += added_len
+                    last_progress_ts = datetime.now().timestamp()
+
+                # Enforce limits: if tripped, force a graceful finish
+                now_ts = datetime.now().timestamp()
+                hit_time_limit = (now_ts - stream_start_ts) > max_stream_seconds
+                hit_idle_limit = (now_ts - last_progress_ts) > max_stream_idle_seconds
+                hit_char_limit = total_response_chars >= max_total_response_chars
+                if hit_time_limit or hit_idle_limit or hit_char_limit:
+                    if hit_time_limit:
+                        user_warnings.add(f"⚠️ Stream timed out after {max_stream_seconds}s")
+                    if hit_idle_limit:
+                        user_warnings.add("⚠️ Stream ended due to inactivity")
+                    if hit_char_limit:
+                        user_warnings.add(f"⚠️ Max response length reached ({max_total_response_chars} chars)")
+                    if finish_reason is None:
+                        finish_reason = "length"  # trigger finalization below
 
                 if not use_plain_responses:
                     ready_to_edit = (edit_task == None or edit_task.done()) and datetime.now().timestamp() - last_task_time >= EDIT_DELAY_SECONDS
