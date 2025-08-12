@@ -11,3 +11,5 @@
 !config-example.yaml
 !docker-compose.yaml
 !requirements.txt
+!.github/*
+!.github/workflows/docker-publish.yml
