@@ -454,7 +454,7 @@ async def on_message(new_msg: discord.Message) -> None:
 
                 # Accumulate streaming content correctly; don't drop the first characters
                 delta = choice.delta.content or ""
-                logging.info(f"API response chunk: {delta}")
+                logging.debug(f"API response chunk: {delta}")
 
                 # Skip empty progress unless it's the final packet
                 if response_contents == [] and delta == "" and finish_reason is None:
