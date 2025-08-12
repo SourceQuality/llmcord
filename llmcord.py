@@ -401,9 +401,9 @@ async def on_message(new_msg: discord.Message) -> None:
     max_message_length = 2000 if use_plain_responses else (4096 - len(STREAMING_INDICATOR))
 
     # Safety limits to prevent endless streaming
-    max_stream_seconds = config.get("max_stream_seconds", 90)
+    max_stream_seconds = config.get("max_stream_seconds", 15)
     max_stream_idle_seconds = config.get("max_stream_idle_seconds", 60)
-    max_total_response_chars = config.get("max_total_response_chars", 90000)
+    max_total_response_chars = config.get("max_total_response_chars", 40000)
 
     stream_start_ts = datetime.now().timestamp()
     last_progress_ts = stream_start_ts
