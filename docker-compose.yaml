@@ -6,5 +6,4 @@ services:
     restart: unless-stopped
     volumes:
       - ./config.yaml:/usr/src/app/config.yaml:ro
-      - ./llmcord.py:/usr/src/app/llmcord.py:ro
       - ./db:/opt/llmcord/db
